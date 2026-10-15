@@ -1,0 +1,148 @@
+name: Build Fruit Verse Go APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'VarunFruit.zip'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Extract game project
+        shell: bash
+        run: |
+          set -e
+          ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -name '*.zip' -print -quit)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in the repository root."
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/extracted-project"
+          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/extracted-project"
+          PUBSPEC="$(find "$GITHUB_WORKSPACE/extracted-project" -name pubspec.yaml -print -quit)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "ERROR: pubspec.yaml was not found inside the ZIP."
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$PUBSPEC")" >> "$GITHUB_ENV"
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.5'
+          channel: stable
+          cache: true
+
+      - name: Fix old AR plugin repositories
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+
+          import re
+
+          root = Path(".")
+          for gradle_file in root.glob("**/build.gradle"):
+              if ".dart_tool" in str(gradle_file):
+                  continue
+              text = gradle_file.read_text()
+              updated = re.sub(r"(?m)^\s*jcenter\(\)\s*$", "mavenCentral()", text)
+              if updated != text:
+                  gradle_file.write_text(updated)
+                  print(f"Updated repositories in {gradle_file}")
+
+          pubspec = root / "pubspec.yaml"
+          if pubspec.exists():
+              text = pubspec.read_text()
+              text = text.replace(
+                  "geolocator: ^13.0.2",
+                  "geolocator: ^9.0.2"
+              )
+              pubspec.write_text(text)
+          PY
+
+      - name: Generate Android project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter create --platforms=android --project-name fruit_verse_go .
+
+      - name: Configure Android permissions and minimum SDK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text()
+
+          permissions = [
+              "android.permission.CAMERA",
+              "android.permission.ACCESS_FINE_LOCATION",
+              "android.permission.ACCESS_COARSE_LOCATION",
+              "android.permission.INTERNET",
+          ]
+
+          for permission in permissions:
+              line = f'    <uses-permission android:name="{permission}"/>'
+              if permission not in text:
+                  text = text.replace("<manifest", "<manifest", 1)
+                  pos = text.find(">")
+                  text = text[:pos + 1] + "\n" + line + text[pos + 1:]
+
+          manifest.write_text(text)
+
+          gradle = Path("android/app/build.gradle")
+          if gradle.exists():
+              content = gradle.read_text()
+              content = re.sub(
+                  r"minSdk\s*=\s*\d+",
+                  "minSdk = 24",
+                  content
+              )
+              content = re.sub(
+                  r"minSdkVersion\s+\d+",
+                  "minSdkVersion 24",
+                  content
+              )
+              gradle.write_text(content)
+          PY
+
+      - name: Format Dart code
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: dart format lib
+
+      - name: Get Flutter packages
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter build apk --release
+
+      - name: Save APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fruit-Verse-Go-APK
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 7
